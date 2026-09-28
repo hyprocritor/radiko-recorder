@@ -2,7 +2,9 @@ use crate::{
     api::{Radiko, redact},
     diagnostics::{self, guard_task},
     media::{self, AudioControl, MediaEvent, Outcome, StopReason, StreamSource},
-    model::{JobStatus, Program, RecordingJob, jst, parse_editor_time, validate_station},
+    model::{
+        JobStatus, Program, RecordingJob, StreamIssue, jst, parse_editor_time, validate_station,
+    },
     scheduler::{self, Decision},
     store::Store,
 };
@@ -60,6 +62,11 @@ struct Editor {
     error: String,
 }
 
+enum IssueView {
+    Recording(Uuid),
+    Preview,
+}
+
 struct App {
     config: Config,
     station: String,
@@ -83,6 +90,9 @@ struct App {
     last_refresh: Instant,
     last_save: Instant,
     dirty: bool,
+    issue_view: Option<IssueView>,
+    issue_scroll: u16,
+    preview_issues: Vec<StreamIssue>,
 }
 
 impl App {
@@ -113,6 +123,9 @@ impl App {
             last_refresh: Instant::now(),
             last_save: Instant::now(),
             dirty: false,
+            issue_view: None,
+            issue_scroll: 0,
+            preview_issues: Vec::new(),
         }
     }
 
@@ -357,6 +370,29 @@ impl App {
         if key.kind == KeyEventKind::Release || self.shutting_down {
             return;
         }
+        if self.issue_view.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('e' | 'E') => self.issue_view = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.issue_scroll = self.issue_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.issue_scroll = self.issue_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => self.issue_scroll = self.issue_scroll.saturating_add(10),
+                KeyCode::PageUp => self.issue_scroll = self.issue_scroll.saturating_sub(10),
+                KeyCode::Char('q') => {
+                    self.issue_view = None;
+                    self.request_exit();
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.issue_view = None;
+                    self.request_exit();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.confirm_exit {
             match key.code {
                 KeyCode::Char('y' | 'Y') => self.begin_shutdown(),
@@ -396,6 +432,19 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('e') => {
+                if let Some(&index) = self
+                    .visible_jobs()
+                    .get(self.job_state.selected().unwrap_or(0))
+                {
+                    self.issue_view = Some(IssueView::Recording(self.jobs[index].id));
+                    self.issue_scroll = 0;
+                }
+            }
+            KeyCode::Char('E') => {
+                self.issue_view = Some(IssueView::Preview);
+                self.issue_scroll = 0;
+            }
             KeyCode::Char('q') => self.request_exit(),
             KeyCode::Char('r') => self.request_schedule(api.clone(), app_tx.clone()),
             KeyCode::Tab => self.focus = (self.focus + 1) % 3,
@@ -599,6 +648,7 @@ impl App {
                                     has_gap: true,
                                     bytes: backup.bytes,
                                     seconds: backup.recorded_seconds,
+                                    issues: backup.issues,
                                 },
                             });
                         }
@@ -611,6 +661,19 @@ impl App {
 
     async fn media_event(&mut self, event: MediaEvent) {
         match event {
+            MediaEvent::Issues { id, issues } => {
+                if let Some(id) = id {
+                    if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        job.has_gap = issues
+                            .iter()
+                            .any(|i| i.state != crate::model::RecoveryState::Recovered);
+                        job.issues = issues;
+                        self.dirty = true;
+                    }
+                } else {
+                    self.preview_issues = issues;
+                }
+            }
             MediaEvent::Status { id, status, detail } => {
                 if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
                     job.status = status;
@@ -633,6 +696,7 @@ impl App {
                     job.has_gap = outcome.has_gap;
                     job.bytes = outcome.bytes;
                     job.recorded_seconds = outcome.seconds;
+                    job.issues = outcome.issues;
                     self.message = format!("{}：{}", job.program.title, job.detail);
                     self.dirty = true;
                 }
@@ -915,12 +979,28 @@ fn draw(frame: &mut Frame, app: &mut App) {
             let countdown = (j.effective_start() - Utc::now()).num_seconds().max(0);
             Row::new(vec![
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     j.status.label(),
                     if j.schedule_changed {
                         " ⚠节目变更"
                     } else {
                         ""
+                    },
+                    if j.issues
+                        .iter()
+                        .any(|i| i.state != crate::model::RecoveryState::Recovered)
+                    {
+                        format!(
+                            " ⚠{}",
+                            j.issues
+                                .iter()
+                                .filter(|i| i.state != crate::model::RecoveryState::Recovered)
+                                .count()
+                        )
+                    } else if j.issues.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ↺{}", j.issues.len())
                     }
                 ),
                 j.start
@@ -964,8 +1044,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .map(|&i| {
             let j = &app.jobs[i];
             format!(
-                "{}{}",
+                "{}{}{}",
                 j.detail,
+                j.issues
+                    .iter()
+                    .rev()
+                    .find(|i| i.state != crate::model::RecoveryState::Recovered)
+                    .or_else(|| j.issues.last())
+                    .map(|i| format!(
+                        " · {} {} JST · e 详情",
+                        i.start.with_timezone(&jst()).format("%H:%M:%S"),
+                        i.state.label()
+                    ))
+                    .unwrap_or_default(),
                 j.output
                     .as_ref()
                     .map(|p| format!(" · {}", p.display()))
@@ -978,7 +1069,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         job_area[1],
     );
     let footer = format!(
-        "{}\nTab 面板 · Enter 预约 · r 刷新 · p 试听 · +/- 音量 · m 静音 · q 退出{}",
+        "{}\nTab 面板 · Enter 预约 · e 录制错误 · E 试听错误 · p 试听 · +/- 音量 · q 退出{}",
         app.message,
         app.config
             .ffmpeg_error
@@ -987,6 +1078,64 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .unwrap_or_default()
     );
     frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), layout[3]);
+    if let Some(view) = &app.issue_view {
+        let (title, issues) = match view {
+            IssueView::Recording(id) => (
+                "录制错误与补片记录",
+                app.jobs
+                    .iter()
+                    .find(|j| j.id == *id)
+                    .map(|j| j.issues.as_slice())
+                    .unwrap_or_default(),
+            ),
+            IssueView::Preview => ("试听错误与重连记录", app.preview_issues.as_slice()),
+        };
+        let text = if issues.is_empty() {
+            "暂无错误记录。\n分片时间来自直播清单；估计时间来自本机时钟。".into()
+        } else {
+            issues
+                .iter()
+                .rev()
+                .map(|issue| {
+                    let prefix = match view {
+                        IssueView::Recording(id) => app
+                            .jobs
+                            .iter()
+                            .find(|j| j.id == *id)
+                            .map(|job| {
+                                if issue.end.is_some_and(|end| end <= job.program.start)
+                                    || issue.start >= job.program.end
+                                {
+                                    "[节目外缓冲] "
+                                } else {
+                                    "[节目时段] "
+                                }
+                            })
+                            .unwrap_or(""),
+                        IssueView::Preview => "",
+                    };
+                    format!("{prefix}{}", issue.description())
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        let popup = centered(
+            area,
+            area.width.saturating_sub(4).min(110),
+            area.height.saturating_sub(2),
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.issue_scroll, 0))
+                .block(panel(
+                    format!(" {title} · JST · ↑↓/PgUp/PgDn 滚动 · Esc 关闭 "),
+                    true,
+                )),
+            popup,
+        );
+    }
     if app.station.is_empty() {
         let popup = centered(area, 64, 8);
         frame.render_widget(Clear, popup);
@@ -1090,6 +1239,33 @@ mod tests {
             app.confirm_exit = true;
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             app.confirm_exit = false;
+            app.preview_issues = vec![StreamIssue::new(
+                Utc::now(),
+                Some(Utc::now() + chrono::Duration::seconds(5)),
+                true,
+                "HTTP 404，正在补片",
+            )];
+            app.issue_view = Some(IssueView::Preview);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            if width >= 80 && height >= 24 {
+                // The test backend leaves occluded cells behind wide glyphs;
+                // read each row using display widths, as a real terminal does.
+                let mut rendered = String::new();
+                for row in terminal.backend().buffer().content.chunks(width as usize) {
+                    let mut x = 0;
+                    while x < row.len() {
+                        let symbol = row[x].symbol();
+                        rendered.push_str(symbol);
+                        x += ratatui::text::Span::raw(symbol).width().max(1);
+                    }
+                    rendered.push('\n');
+                }
+                assert!(rendered.contains("HTTP 404"));
+                assert!(rendered.contains("JST"));
+                let compact: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(compact.contains("尝试恢复"), "{width}x{height}: {compact}");
+            }
+            app.issue_view = None;
         }
     }
 }

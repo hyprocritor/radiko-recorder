@@ -1,6 +1,6 @@
 use crate::{
     api::{PermanentError, Radiko, redact},
-    model::{JobStatus, RecordingJob},
+    model::{JobStatus, RecordingJob, RecoveryState, StreamIssue},
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -27,15 +27,22 @@ pub enum StreamSource {
     Url(String),
 }
 impl StreamSource {
-    async fn resolve(&self) -> Result<String> {
+    pub(crate) async fn resolve(&self) -> Result<String> {
         match self {
             Self::Radiko(api, station) => api.live_url(station).await,
             Self::Url(url) => Ok(url.clone()),
         }
     }
-    async fn invalidate(&self) {
+    pub(crate) async fn invalidate(&self) {
         if let Self::Radiko(api, _) = self {
             api.invalidate_auth().await;
+        }
+    }
+
+    async fn prepare(&self) -> Result<()> {
+        match self {
+            Self::Radiko(api, _) => api.prepare().await,
+            Self::Url(_) => Ok(()),
         }
     }
 }
@@ -54,10 +61,15 @@ pub struct Outcome {
     pub has_gap: bool,
     pub bytes: u64,
     pub seconds: f64,
+    pub issues: Vec<StreamIssue>,
 }
 
 #[derive(Debug)]
 pub enum MediaEvent {
+    Issues {
+        id: Option<Uuid>,
+        issues: Vec<StreamIssue>,
+    },
     Status {
         id: Uuid,
         status: JobStatus,
@@ -142,7 +154,7 @@ fn input_options(command: &mut Command, url: &str) {
         "-http_seekable",
         "0",
         "-user_agent",
-        "radiko-recorder/0.1",
+        concat!("radiko-recorder/", env!("CARGO_PKG_VERSION")),
         "-rw_timeout",
         "15000000",
         "-reconnect",
@@ -187,14 +199,17 @@ async fn stderr_tail(
     tail.into_iter().collect::<Vec<_>>().join(" ")
 }
 
-async fn delay_or_stop(duration: Duration, stop: &mut watch::Receiver<Option<StopReason>>) -> bool {
+pub(crate) async fn delay_or_stop(
+    duration: Duration,
+    stop: &mut watch::Receiver<Option<StopReason>>,
+) -> bool {
     if stop.borrow().is_some() {
         return true;
     }
     tokio::select! { _ = sleep(duration) => false, _ = stop.changed() => true }
 }
 
-fn remaining(job: &RecordingJob) -> Duration {
+pub(crate) fn remaining(job: &RecordingJob) -> Duration {
     (job.effective_end() - Utc::now())
         .to_std()
         .unwrap_or(Duration::ZERO)
@@ -215,7 +230,12 @@ async fn resolve_before_deadline(
     }
 }
 
-fn status(tx: &mpsc::UnboundedSender<MediaEvent>, id: Uuid, state: JobStatus, detail: &str) {
+pub(crate) fn status(
+    tx: &mpsc::UnboundedSender<MediaEvent>,
+    id: Uuid,
+    state: JobStatus,
+    detail: &str,
+) {
     tracing::info!(job_id = %id, status = ?state, detail, "录制状态更新");
     let _ = tx.send(MediaEvent::Status {
         id,
@@ -240,8 +260,21 @@ pub async fn record(
         has_gap: job.has_gap,
         bytes: job.bytes,
         seconds: job.recorded_seconds,
+        issues: job.issues.clone(),
     };
-    let result = record_inner(&job, &binary, &source, &tx, &mut stop, &mut outcome).await;
+    let result: Result<()> = async {
+        // Authentication can be prepared early, but media URLs must be fresh when used.
+        if Utc::now() < job.effective_start() && stop.borrow().is_none() {
+            tokio::select! { result = source.prepare() => if let Err(error) = result { tracing::warn!(error = %redact(&format!("{error:#}")), "提前认证失败，将在开始时重试"); }, _ = stop.changed() => {} }
+            while Utc::now() < job.effective_start() && stop.borrow().is_none() {
+                if delay_or_stop(Duration::from_millis(100), &mut stop).await { break; }
+            }
+        }
+        if !crate::capture::run(&job, &binary, &source, &tx, &mut stop, &mut outcome).await? {
+            record_inner(&job, &binary, &source, &tx, &mut stop, &mut outcome).await?;
+        }
+        Ok(())
+    }.await;
     if let Err(error) = result {
         tracing::error!(job_id = %job.id, error = %format!("{error:#}"), "录制任务失败");
         outcome.status = if outcome.bytes > 0 {
@@ -250,6 +283,14 @@ pub async fn record(
             JobStatus::Failed
         };
         outcome.has_gap = true;
+        let mut issue = StreamIssue::new(
+            Utc::now(),
+            Some(Utc::now()),
+            false,
+            redact(&format!("{error:#}")),
+        );
+        issue.state = RecoveryState::Unavailable;
+        outcome.issues.push(issue);
         outcome.detail = redact(&format!(
             "{error:#}；临时文件目录：{}",
             job.parts_dir().display()
@@ -280,6 +321,17 @@ async fn record_inner(
     outcome.bytes = part_bytes(&parts).await;
     let mut attempt = 0;
     let mut auth_retries = 0;
+    let mut pending_issue: Option<usize> = None;
+    if job.has_gap && outcome.issues.is_empty() {
+        let mut issue = StreamIssue::new(
+            job.effective_start(),
+            Some(Utc::now().min(job.effective_end())),
+            false,
+            "恢复旧版录制；缺少分片索引，无法核对历史缺口",
+        );
+        issue.state = RecoveryState::Suspected;
+        outcome.issues.push(issue);
+    }
     let mut failure: Option<String> = None;
     status(tx, job.id, JobStatus::Preparing, "准备认证和直播流");
     while !remaining(job).is_zero() && stop.borrow().is_none() {
@@ -301,6 +353,21 @@ async fn record_inner(
                 );
                 if Utc::now() > job.effective_start() {
                     outcome.has_gap = true;
+                    if let Some(i) = pending_issue {
+                        outcome.issues[i].attempts += 1;
+                    } else {
+                        pending_issue = Some(outcome.issues.len());
+                        outcome.issues.push(StreamIssue::new(
+                            Utc::now(),
+                            None,
+                            false,
+                            message.clone(),
+                        ));
+                    }
+                    let _ = tx.send(MediaEvent::Issues {
+                        id: Some(job.id),
+                        issues: outcome.issues.clone(),
+                    });
                 }
                 let wait = backoff(attempt).min(remaining(job));
                 attempt += 1;
@@ -320,6 +387,16 @@ async fn record_inner(
         }
         if Utc::now() > job.effective_start() + chrono::Duration::seconds(5) {
             outcome.has_gap = true;
+            if outcome.issues.is_empty() {
+                let mut issue = StreamIssue::new(
+                    job.effective_start(),
+                    Some(Utc::now()),
+                    false,
+                    "启动晚于预约窗口；兼容模式无法核对音频边界",
+                );
+                issue.state = RecoveryState::Suspected;
+                outcome.issues.push(issue);
+            }
         }
         // A fresh UUID prevents overwriting even empty files left by abrupt termination.
         let part =
@@ -359,7 +436,7 @@ async fn record_inner(
             job.id,
             JobStatus::Recording,
             if outcome.has_gap {
-                "正在录制；有缺失内容"
+                "正在录制；可能存在缺口 · e 查看时间段"
             } else {
                 "正在录制"
             },
@@ -368,7 +445,6 @@ async fn record_inner(
         let baseline_bytes = outcome.bytes;
         let mut last_bytes = 0;
         let mut last_activity = Instant::now();
-        let mut last_tick = Utc::now();
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         let mut progress_open = true;
         let mut expected_stop = false;
@@ -383,14 +459,16 @@ async fn record_inner(
                             let new_seconds = baseline_seconds + value.max(0.0) / 1_000_000.0;
                             if new_seconds > outcome.seconds { last_activity = Instant::now(); }
                             outcome.seconds = new_seconds;
+                            if new_seconds > baseline_seconds && let Some(i) = pending_issue.take() {
+                                outcome.issues[i].end = Some(Utc::now()); outcome.issues[i].state = RecoveryState::Suspected;
+                                outcome.issues[i].reason.push_str("；直播已恢复，兼容模式无法核对缺口是否补齐");
+                                let _ = tx.send(MediaEvent::Issues { id: Some(job.id), issues: outcome.issues.clone() });
+                            }
                         },
                         _ => progress_open = false,
                     }
                 }
                 _ = ticker.tick() => {
-                    let now = Utc::now();
-                    if (now-last_tick).num_seconds() > 3 { outcome.has_gap = true; }
-                    last_tick = now;
                     let bytes = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
                     if bytes > last_bytes { last_bytes = bytes; last_activity = Instant::now(); }
                     outcome.bytes = baseline_bytes + bytes;
@@ -430,6 +508,24 @@ async fn record_inner(
         }
         tracing::warn!(job_id = %job.id, exit = ?exited, stalled = forced_gap, attempt, detail = %tail, "录音流提前结束");
         outcome.has_gap = true;
+        if outcome.seconds - baseline_seconds >= 10.0 {
+            auth_retries = 0;
+            attempt = 0;
+        }
+        let affected_start = (Utc::now()
+            - chrono::Duration::from_std(last_activity.elapsed()).unwrap_or_default())
+        .max(job.effective_start());
+        pending_issue = Some(outcome.issues.len());
+        outcome.issues.push(StreamIssue::new(
+            affected_start,
+            None,
+            false,
+            redact(&format!("兼容模式断流，正在重连：{tail}")),
+        ));
+        let _ = tx.send(MediaEvent::Issues {
+            id: Some(job.id),
+            issues: outcome.issues.clone(),
+        });
         if warning.contains("401") || warning.contains("403") {
             if auth_retries >= 1 {
                 failure = Some("直播访问被拒绝；重新认证后仍无法收听，请检查地区权限".into());
@@ -471,6 +567,12 @@ async fn record_inner(
         );
         outcome.output = Some(finalize(binary, job, &parts).await?);
     }
+    for issue in &mut outcome.issues {
+        if issue.state == RecoveryState::Retrying {
+            issue.end = Some(Utc::now().min(job.effective_end()));
+            issue.state = RecoveryState::Suspected;
+        }
+    }
     let reason = *stop.borrow();
     outcome.status = match reason {
         Some(StopReason::Shutdown) => JobStatus::Interrupted,
@@ -484,7 +586,7 @@ async fn record_inner(
     }
     outcome.detail = failure.unwrap_or_else(|| match outcome.status {
         JobStatus::Complete => "录制完成".into(),
-        JobStatus::Partial => "音频已保存，但存在缺口；原始片段已保留".into(),
+        JobStatus::Partial => "音频已保存；可能存在缺口，按 e 查看时间段".into(),
         JobStatus::Cancelled => "预约已取消，已录内容已保留".into(),
         JobStatus::Interrupted => "退出时中断；重启可恢复录制窗口内的任务".into(),
         _ => "未收到音频，请检查网络、地区权限和 FFmpeg".into(),
@@ -508,7 +610,7 @@ fn disk_error(value: &str) -> bool {
     .any(|s| value.contains(s))
 }
 
-async fn existing_parts(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) async fn existing_parts(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -685,8 +787,6 @@ async fn preview_inner(
     controls: &AudioControl,
     stop: &mut watch::Receiver<Option<StopReason>>,
 ) -> Result<()> {
-    let url =
-        tokio::select! { url = source.resolve() => url?, _ = stop.changed() => return Ok(()) };
     let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let audio_control = controls.clone();
@@ -728,45 +828,83 @@ async fn preview_inner(
         })
         .context("无法启动音频播放线程")?;
     let result: Result<()> = async {
-        if !ready_rx.await.unwrap_or(false) { bail!("无法打开音频输出设备；预约录音仍可使用"); }
-        if stop.borrow().is_some() { return Ok(()); }
-        let mut cmd = command(binary);
-        input_options(&mut cmd, &url);
-        let mut child = cmd.args(["-map", "0:a:0", "-vn", "-f", "f32le", "-acodec", "pcm_f32le", "-ar", "48000", "-ac", "2", "pipe:1"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("无法启动试听 FFmpeg")?;
-        tracing::info!(pid = ?child.id(), "试听 FFmpeg 已启动");
-        let stderr = tokio::spawn(stderr_tail(child.stderr.take().unwrap(), "试听".into(), child.id()));
-        let mut stdout = child.stdout.take().unwrap();
-        let _ = tx.send(MediaEvent::Preview { active: true, detail: "正在试听当前直播".into() });
-        let mut bytes = [0u8; 8192];
-        let mut carry = Vec::new();
-        let mut error = None;
-        'stream: loop {
-            let read = tokio::select! { read = stdout.read(&mut bytes) => read, _ = stop.changed() => break };
-            let count = match read { Ok(0) => { error = Some("试听流已结束".to_string()); break; }, Ok(n) => n, Err(_) => { error = Some("读取试听音频失败".into()); break; } };
-            carry.extend_from_slice(&bytes[..count]);
-            let aligned = carry.len() / 8 * 8; // full stereo f32 frames only
-            let mut samples: Vec<f32> = carry[..aligned].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-            carry.drain(..aligned);
-            loop {
-                match audio_tx.try_send(samples) {
-                    Ok(_) => break,
-                    Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                        samples = returned;
-                        if delay_or_stop(Duration::from_millis(20), stop).await { break 'stream; }
-                    },
-                    Err(_) => { error = Some("音频播放线程已停止".into()); break 'stream; },
-                }
+        if !ready_rx.await.unwrap_or(false) {
+            bail!("无法打开音频输出设备；预约录音仍可使用");
+        }
+        let mut issues: Vec<StreamIssue> = Vec::new();
+        let mut attempt = 0;
+        let mut denied = 0;
+        while stop.borrow().is_none() && !controls.stopped.load(Ordering::Relaxed) {
+            let started = Instant::now();
+            let mut heard = false;
+            let result =
+                preview_session(binary, source, tx, &audio_tx, stop, &mut issues, &mut heard).await;
+            if result.is_ok() || stop.borrow().is_some() {
+                break;
+            }
+            let error = result.unwrap_err();
+            let message = redact(&format!("{error:#}"));
+            if heard {
+                denied = 0;
+            }
+            if message.contains("401") || message.contains("403") {
+                denied += 1;
+            }
+            let permanent = error.downcast_ref::<PermanentError>().is_some() || denied >= 2;
+            if let Some(issue) = issues
+                .last_mut()
+                .filter(|i| i.state == RecoveryState::Retrying)
+            {
+                issue.reason = message.clone();
+                issue.attempts += 1;
+            } else {
+                let mut issue = StreamIssue::new(Utc::now(), None, false, message.clone());
+                issue.attempts = 1;
+                issues.push(issue);
+            }
+            if issues.len() > 100 {
+                issues.remove(0);
+            }
+            if permanent {
+                let issue = issues.last_mut().unwrap();
+                issue.state = RecoveryState::Unavailable;
+                issue.end = Some(Utc::now());
+                let _ = tx.send(MediaEvent::Issues {
+                    id: None,
+                    issues: issues.clone(),
+                });
+                return Err(error);
+            }
+            tracing::warn!(error = %message, "试听断流，重新获取会话");
+            let _ = tx.send(MediaEvent::Issues {
+                id: None,
+                issues: issues.clone(),
+            });
+            if heard && started.elapsed() >= Duration::from_secs(10) {
+                attempt = 0;
+            }
+            let wait = backoff(attempt);
+            attempt += 1;
+            let _ = tx.send(MediaEvent::Preview {
+                active: true,
+                detail: format!("试听重连中，{} 秒后重试 · E 查看错误时间段", wait.as_secs()),
+            });
+            source.invalidate().await;
+            if delay_or_stop(wait, stop).await {
+                break;
             }
         }
-        // Drain PCM while asking FFmpeg to quit, otherwise a full stdout pipe can prevent exit.
-        let drain = tokio::spawn(async move { let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await; });
-        stop_child(&mut child).await;
-        let tail = stderr.await.unwrap_or_default();
-        let _ = drain.await;
-        if let Some(error) = error { bail!("{error}。{tail}"); }
+        for issue in &mut issues {
+            if issue.state == RecoveryState::Retrying {
+                issue.state = RecoveryState::Unavailable;
+                issue.end = Some(Utc::now());
+                issue.reason.push_str("；用户停止试听");
+            }
+        }
+        let _ = tx.send(MediaEvent::Issues { id: None, issues });
         Ok(())
-    }.await;
+    }
+    .await;
     controls.stop();
     drop(audio_tx);
     match tokio::task::spawn_blocking(move || audio_thread.join()).await {
@@ -783,4 +921,125 @@ async fn preview_inner(
         }
     }
     result
+}
+
+async fn preview_session(
+    binary: &Path,
+    source: &StreamSource,
+    tx: &mpsc::UnboundedSender<MediaEvent>,
+    audio_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    stop: &mut watch::Receiver<Option<StopReason>>,
+    issues: &mut [StreamIssue],
+    heard: &mut bool,
+) -> Result<()> {
+    let url = tokio::select! { result = source.resolve() => result?, _ = stop.changed() => return Ok(()) };
+    if stop.borrow().is_some() {
+        return Ok(());
+    }
+    let mut cmd = command(binary);
+    input_options(&mut cmd, &url);
+    let mut child = cmd
+        .args([
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| PermanentError(format!("无法启动试听 FFmpeg: {error}")))?;
+    tracing::info!(pid = ?child.id(), "试听 FFmpeg 已启动");
+    let stderr = tokio::spawn(stderr_tail(
+        child.stderr.take().unwrap(),
+        "试听".into(),
+        child.id(),
+    ));
+    let mut stdout = child.stdout.take().unwrap();
+    let mut bytes = [0u8; 8192];
+    let mut carry = Vec::new();
+    let mut error = None;
+    let mut audio_closed = false;
+    'stream: loop {
+        let read = tokio::select! { read = tokio::time::timeout(Duration::from_secs(20), stdout.read(&mut bytes)) => read, _ = stop.changed() => break };
+        let count = match read {
+            Ok(Ok(0)) => {
+                error = Some("试听流已结束".to_string());
+                break;
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                error = Some(format!("读取试听音频失败: {e}"));
+                break;
+            }
+            Err(_) => {
+                error = Some("试听流 20 秒未收到音频".into());
+                break;
+            }
+        };
+        if !*heard {
+            *heard = true;
+            for issue in issues
+                .iter_mut()
+                .filter(|i| i.state == RecoveryState::Retrying)
+            {
+                issue.state = RecoveryState::Recovered;
+                issue.end = Some(Utc::now());
+            }
+            let _ = tx.send(MediaEvent::Issues {
+                id: None,
+                issues: issues.to_vec(),
+            });
+            let _ = tx.send(MediaEvent::Preview {
+                active: true,
+                detail: "正在试听当前直播 · E 查看重连记录".into(),
+            });
+        }
+        carry.extend_from_slice(&bytes[..count]);
+        let aligned = carry.len() / 8 * 8;
+        let mut samples: Vec<f32> = carry[..aligned]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        carry.drain(..aligned);
+        loop {
+            match audio_tx.try_send(samples) {
+                Ok(_) => break,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    samples = returned;
+                    if delay_or_stop(Duration::from_millis(20), stop).await {
+                        break 'stream;
+                    }
+                }
+                Err(_) => {
+                    audio_closed = true;
+                    error = Some("音频播放线程已停止".into());
+                    break 'stream;
+                }
+            }
+        }
+    }
+    // Drain PCM while asking FFmpeg to quit, otherwise a full stdout pipe can prevent exit.
+    let drain = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
+    });
+    stop_child(&mut child).await;
+    let tail = stderr.await.unwrap_or_default();
+    let _ = drain.await;
+    if let Some(error) = error {
+        if audio_closed {
+            bail!(PermanentError(error));
+        }
+        bail!("{error}。{tail}");
+    }
+    Ok(())
 }

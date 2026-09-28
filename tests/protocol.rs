@@ -62,6 +62,13 @@ async fn authentication_retry_endpoint_fallback_and_cache() {
         2,
         "re-authenticate once, then reuse the cache"
     );
+    api.invalidate_auth().await;
+    assert_eq!(api.live_url("JORF").await.unwrap(), expected);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "invalidate cached authentication on reconnect"
+    );
     server.abort();
 }
 

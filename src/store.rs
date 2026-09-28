@@ -59,20 +59,38 @@ impl Store {
     }
 
     pub fn save(&self, jobs: &[RecordingJob]) -> Result<()> {
-        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
-        serde_json::to_writer_pretty(
-            &mut tmp,
+        atomic_json(
+            &self.dir.join("jobs.json"),
             &Database {
                 version: 1,
                 jobs: jobs.to_vec(),
             },
-        )?;
-        tmp.write_all(b"\n")?;
-        tmp.as_file().sync_all()?;
-        tmp.persist(self.dir.join("jobs.json"))
-            .context("无法原子保存预约")?;
-        Ok(())
+        )
     }
+}
+
+/// Antivirus/indexers can briefly hold a Windows destination file open. Keep
+/// the original and retry the same atomic replacement instead of exiting immediately.
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("保存路径缺少目录")?)?;
+    serde_json::to_writer_pretty(&mut tmp, value)?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file().sync_all()?;
+    for attempt in 0..6 {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if attempt < 5
+                    && (error.error.kind() == std::io::ErrorKind::PermissionDenied
+                        || matches!(error.error.raw_os_error(), Some(32 | 33))) =>
+            {
+                tmp = error.file;
+                std::thread::sleep(std::time::Duration::from_millis(25 << attempt));
+            }
+            Err(error) => return Err(error).context("无法原子保存数据"),
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(test)]

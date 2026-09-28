@@ -15,7 +15,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -34,7 +34,7 @@ fn ffmpeg() -> PathBuf {
 struct Hls {
     audio: Arc<Vec<u8>>,
     start: Instant,
-    finite_once: Arc<AtomicBool>,
+    finite_once: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
 }
 
@@ -44,7 +44,10 @@ async fn playlist(State(state): State<Hls>, headers: HeaderMap) -> axum::respons
         return "ERROR\n".into_response();
     }
     state.requests.fetch_add(1, Ordering::SeqCst);
-    let finite = state.finite_once.swap(false, Ordering::SeqCst);
+    let finite = state
+        .finite_once
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok();
     let head = state.start.elapsed().as_secs() + 3;
     let mut body = format!(
         "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:{}\n",
@@ -132,7 +135,7 @@ async fn ffmpeg_recording_reconnect_cancel_recovery_and_failed_mux() {
         .await
         .unwrap();
     assert!(sample.status.success());
-    let finite_once = Arc::new(AtomicBool::new(false));
+    let finite_once = Arc::new(AtomicUsize::new(0));
     let state = Hls {
         audio: Arc::new(sample.stdout),
         start: Instant::now(),
@@ -181,7 +184,8 @@ async fn ffmpeg_recording_reconnect_cancel_recovery_and_failed_mux() {
     assert!(normal.bytes > 1000 && normal.seconds > 0.0);
     decode_check(&binary, normal.output.as_ref().unwrap()).await;
 
-    finite_once.store(true, Ordering::SeqCst);
+    // One request probes timeline support; the next is FFmpeg's compatibility input.
+    finite_once.store(2, Ordering::SeqCst);
     let retry_job = job(dir.path(), 12);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (_stop, stop_rx) = watch::channel(None);

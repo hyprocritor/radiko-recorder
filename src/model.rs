@@ -95,6 +95,74 @@ impl JobStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamIssue {
+    pub id: Uuid,
+    pub start: DateTime<Utc>,
+    pub end: Option<DateTime<Utc>>,
+    /// True means timestamps came from HLS program-date-time, otherwise wall clock estimates.
+    pub exact: bool,
+    pub state: RecoveryState,
+    pub reason: String,
+    pub attempts: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RecoveryState {
+    Retrying,
+    Recovered,
+    Unavailable,
+    Suspected,
+}
+
+impl RecoveryState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Retrying => "尝试恢复",
+            Self::Recovered => "已恢复",
+            Self::Unavailable => "未补回",
+            Self::Suspected => "可能缺口",
+        }
+    }
+}
+
+impl StreamIssue {
+    pub fn new(
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+        exact: bool,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            start,
+            end,
+            exact,
+            state: RecoveryState::Retrying,
+            reason: reason.into(),
+            attempts: 0,
+        }
+    }
+
+    pub fn description(&self) -> String {
+        format!(
+            "{} — {} JST · {}{} · 重试 {} 次\n{}",
+            self.start.with_timezone(&jst()).format("%m/%d %H:%M:%S"),
+            self.end
+                .map(|t| t.with_timezone(&jst()).format("%m/%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "持续中".into()),
+            self.state.label(),
+            if self.exact {
+                "（分片时间）"
+            } else {
+                "（估计时间）"
+            },
+            self.attempts,
+            self.reason
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordingJob {
     pub id: Uuid,
     pub program: Program,
@@ -111,6 +179,8 @@ pub struct RecordingJob {
     pub output: Option<PathBuf>,
     #[serde(default)]
     pub schedule_changed: bool,
+    #[serde(default)]
+    pub issues: Vec<StreamIssue>,
 }
 
 impl RecordingJob {
@@ -130,6 +200,7 @@ impl RecordingJob {
             bytes: 0,
             output: None,
             schedule_changed: false,
+            issues: Vec::new(),
         }
     }
 

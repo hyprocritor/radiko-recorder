@@ -1,0 +1,58 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check tag and package version
+        run: |
+          $metadata = cargo +1.94.1 metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'radiko-recorder').version
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag does not match Cargo.toml.' }
+          if (-not (Test-Path "docs/releases/v$version.md")) { throw 'Release notes are missing.' }
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build Windows x64 executable
+        run: |
+          cargo +1.94.1 build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package executable, symbols, and documentation
+        run: ./scripts/package-release.ps1 -Version $env:RELEASE_VERSION -BinaryDir target/x86_64-pc-windows-msvc/release
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $archive = "target/release-assets/radiko-recorder-v$env:RELEASE_VERSION-windows-x86_64.zip"
+          gh release create $env:GITHUB_REF_NAME $archive target/release-assets/SHA256SUMS.txt --verify-tag --title "Radiko Recorder v$env:RELEASE_VERSION" --notes-file "docs/releases/v$env:RELEASE_VERSION.md" --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

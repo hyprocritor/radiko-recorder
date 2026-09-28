@@ -11,7 +11,9 @@ pub enum Decision {
 fn has_parts(job: &RecordingJob) -> bool {
     std::fs::read_dir(job.parts_dir()).is_ok_and(|entries| {
         entries.flatten().any(|e| {
-            e.path().extension().is_some_and(|ext| ext == "ts")
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "ts" || ext == "aac")
                 && e.metadata().is_ok_and(|m| m.len() > 0)
         })
     })

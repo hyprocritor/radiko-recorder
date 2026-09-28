@@ -5,7 +5,10 @@ use regex::Regex;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use std::{
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OnceCell};
@@ -26,6 +29,7 @@ struct Auth {
     token: String,
     area: String,
     created: Instant,
+    generation: u64,
 }
 
 pub struct Radiko {
@@ -34,6 +38,7 @@ pub struct Radiko {
     web_base: String,
     key: OnceCell<String>,
     auth: Mutex<Option<Auth>>,
+    auth_generation: AtomicU64,
 }
 
 impl Radiko {
@@ -45,7 +50,7 @@ impl Radiko {
     pub fn with_endpoints(api: &str, web: &str) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .user_agent("radiko-recorder/0.1")
+                .user_agent(concat!("radiko-recorder/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(20))
                 .build()?,
@@ -53,6 +58,7 @@ impl Radiko {
             web_base: web.trim_end_matches('/').into(),
             key: OnceCell::new(),
             auth: Mutex::new(None),
+            auth_generation: AtomicU64::new(0),
         })
     }
 
@@ -98,8 +104,10 @@ impl Radiko {
 
     async fn authenticate(&self, force: bool) -> Result<Auth> {
         let mut cache = self.auth.lock().await;
+        let generation = self.auth_generation.load(Ordering::Acquire);
         if !force
             && let Some(auth) = cache.as_ref()
+            && auth.generation == generation
             && auth.created.elapsed() < Duration::from_secs(3600)
         {
             return Ok(auth.clone());
@@ -160,13 +168,21 @@ impl Radiko {
             token,
             area: area.into(),
             created: Instant::now(),
+            generation,
         };
         *cache = Some(auth.clone());
         Ok(auth)
     }
 
     pub async fn invalidate_auth(&self) {
-        *self.auth.lock().await = None;
+        // Never wait for another recording's in-flight authentication while
+        // cancelling or refreshing this stream. Old generations are not reused.
+        self.auth_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Prepare credentials only. A media session must be created at recording time.
+    pub async fn prepare(&self) -> Result<()> {
+        self.authenticate(false).await.map(|_| ())
     }
 
     pub async fn live_url(&self, station: &str) -> Result<String> {
