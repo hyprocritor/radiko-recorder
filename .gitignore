@@ -1,0 +1,7 @@
+/target/
+/recordings/
+/tools/
+/player.min.js
+/.radiko-recorder/
+*.har
+*.log
